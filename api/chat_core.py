@@ -20,14 +20,21 @@ redis_client = redis.Redis.from_url(os.getenv("REDIS_URL", "redis://localhost:63
 
 def make_chain(session_id: str) -> ConversationChain:
 
+    print(f'\n This is Session_id: {session_id}\n')
+
     history = RedisChatMessageHistory(
         session_id=session_id,
         redis_client=redis_client,
     )
+    
+    print(f'\n This is History: {history}\n')
+
     memory = ConversationBufferMemory(
         chat_memory=history,
         return_messages=True,
     )
+
+    print(f'\n This is Memory: {memory}\n')
 
     # --- updated prompt construction ---
     prompt = ChatPromptTemplate.from_messages([
