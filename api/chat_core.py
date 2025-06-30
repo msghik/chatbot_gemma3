@@ -59,17 +59,10 @@ def make_chain(session_id: str) -> ConversationChain:
     ])
 
     # --- LM Studio Integration ---
-    # Instantiate the ChatOpenAI class to connect to your LM Studio server.
-    # By default, LM Studio runs on port 1234.
     llm = ChatOpenAI(
-        # The model parameter is not strictly required if you have only one model loaded in LM Studio,
-        # but it's good practice. You can often find the model identifier in LM Studio's UI.
         model="google/gemma-3-4b", 
         temperature=0.7,
-        # Point the base_url to your LM Studio server's IP address and port.
-        # Remember to include the /v1 suffix.
         base_url="http://192.168.120.138:1234/v1",
-        # LM Studio does not require an API key, so a placeholder is sufficient.
         api_key="not-needed"
     )
     # ---------------------------

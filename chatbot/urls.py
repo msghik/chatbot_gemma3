@@ -5,7 +5,7 @@ from rest_framework_simplejwt.views import (
     TokenRefreshView,
     TokenVerifyView
 )
-from api.views import ChatAPIView
+from api.views import ChatAPIView, DeleteChatHistoryAPIView
 from api.auth_views import TokenVerifyWithUserIdView 
 
 urlpatterns = [
@@ -18,4 +18,6 @@ urlpatterns = [
 
     # chat endpoint
     path("api/chat/", ChatAPIView.as_view(), name="chat"),
+    path("api/chat/delete/", DeleteChatHistoryAPIView.as_view(), name='delete_chat_history'),
+
 ]
