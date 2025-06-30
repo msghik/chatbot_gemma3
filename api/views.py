@@ -1,60 +1,82 @@
+from rest_framework import generics, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.permissions import IsAuthenticated
-from rest_framework import status
-from .chat_core import make_chain
+from rest_framework.exceptions import NotFound
+
+from .models import ChatSession
+from .serializers import ChatSessionSerializer
 from .chat_core import make_chain, redis_client
 
-class ChatAPIView(APIView):
+# --- View for Managing Chat Sessions (List and Create) ---
+class ChatSessionListCreateAPIView(generics.ListCreateAPIView):
+    """
+    API view to list all chat sessions for a user or create a new one.
+    GET: Returns a list of the user's chat sessions.
+    POST: Creates a new chat session for the user.
+    """
+    permission_classes = [IsAuthenticated]
+    serializer_class = ChatSessionSerializer
+
+    def get_queryset(self):
+        # Only return sessions belonging to the currently authenticated user
+        return ChatSession.objects.filter(user=self.request.user).order_by('-created_at')
+
+    def perform_create(self, serializer):
+        # Automatically assign the current user to the new chat session
+        serializer.save(user=self.request.user)
+
+
+# --- View for Handling a specific Chat Session (Send Message, Delete) ---
+class ChatSessionDetailAPIView(APIView):
+    """
+    API view to interact with a specific chat session.
+    POST: Send a new message to this chat session.
+    DELETE: Delete this chat session and its history from Redis.
+    """
     permission_classes = [IsAuthenticated]
 
-    def post(self, request, *args, **kwargs):
+    def get_chat_session(self, user, session_id):
+        """Helper to get and validate the chat session."""
+        try:
+            return ChatSession.objects.get(id=session_id, user=user)
+        except ChatSession.DoesNotExist:
+            raise NotFound("Chat session not found.")
+
+    def post(self, request, session_id, *args, **kwargs):
+        """
+        Handles sending a new message to a specific chat session.
+        """
+        chat_session = self.get_chat_session(request.user, session_id)
+        
         message = request.data.get("message")
         if not message:
-            return Response({"detail": "message field is required"},
-                            status=status.HTTP_400_BAD_REQUEST)
+            return Response({"detail": "message field is required"}, status=status.HTTP_400_BAD_REQUEST)
 
-        session_id = str(request.user.id)         
-        chain = make_chain(session_id)
+        # IMPORTANT: Create a unique session_id for LangChain/Redis
+        langchain_session_id = f"user_{request.user.id}_chat_{chat_session.id}"
+        
+        chain = make_chain(langchain_session_id)
         answer = chain.predict(input=message)
+        
         return Response({"answer": answer})
-    
 
-# Add this new view
-class DeleteChatHistoryAPIView(APIView):
-    """
-    Deletes all conversation history for the authenticated user from Redis
-    by scanning for and deleting all matching keys.
-    """
-    permission_classes = [IsAuthenticated]
-
-    def delete(self, request, *args, **kwargs):
+    def delete(self, request, session_id, *args, **kwargs):
         """
-        Handles the DELETE request to clear the user's chat history.
+        Deletes a chat session from the database and its history from Redis.
         """
-        try:
-            session_id = str(request.user.id)
-            
-            # CORRECTED: Define the pattern to match all keys for the user's session.
-            # Your Redis data shows keys like 'chat:1:01JZ03QAD9WYV1E28DWN72PW2M'
-            pattern = f"chat:{session_id}:*"
-            
-            # Use scan_iter to find all keys matching the pattern without blocking the server.
-            keys_to_delete = [key for key in redis_client.scan_iter(match=pattern)]
-            
-            if keys_to_delete:
-                # If keys are found, delete them all in a single operation.
-                redis_client.delete(*keys_to_delete)
-                print(f"Deleted {len(keys_to_delete)} keys for pattern '{pattern}' for user {session_id}")
-                return Response(status=status.HTTP_204_NO_CONTENT)
-            else:
-                # This is the message you were seeing.
-                print(f"No Redis keys found matching pattern '{pattern}' for user {session_id}. Nothing to delete.")
-                return Response(status=status.HTTP_204_NO_CONTENT)
+        chat_session = self.get_chat_session(request.user, session_id)
 
-        except Exception as e:
-            print(f"Error deleting chat history for user {request.user.id}: {e}")
-            return Response(
-                {"detail": "An error occurred while trying to delete the chat history."},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        # 1. Delete the history from Redis
+        langchain_session_id = f"user_{request.user.id}_chat_{chat_session.id}"
+        pattern = f"chat:{langchain_session_id}:*"
+        keys_to_delete = [key for key in redis_client.scan_iter(match=pattern)]
+        
+        if keys_to_delete:
+            redis_client.delete(*keys_to_delete)
+            print(f"Deleted {len(keys_to_delete)} Redis keys for session {chat_session.id}")
+        
+        # 2. Delete the session from the SQL database
+        chat_session.delete()
+        
+        return Response(status=status.HTTP_204_NO_CONTENT)
