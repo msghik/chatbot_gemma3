@@ -1,78 +1,177 @@
-#!/usr/bin/env python3
-"""
-Quick end-to-end test for the Django-LangChain chatbot.
+import requests
+import json
+import sys
 
-▪ Logs in as two users
-▪ Posts chat messages
-▪ Confirms Redis has distinct histories
-"""
+# --- CONFIGURATION ---
+BASE_URL = "http://127.0.0.1:8000"
+ADMIN_USER = {"username": "admin", "password": "admin"}
+FOO_USER = {"username": "foo", "password": "foo"}
 
-import os, json, sys, time
-import requests, redis
-from typing import List
+def run_tests():
+    """Main function to orchestrate the API tests."""
+    print("🚀 Starting Chatbot API Test Suite...")
+    
+    # 1. Authenticate both users and get their tokens
+    print("\nStep 1: Authenticating users...")
+    admin_token = get_jwt_token(ADMIN_USER)
+    foo_token = get_jwt_token(FOO_USER)
 
-# ── configurable bits ──────────────────────────────────────────────────────────
-BASE_URL   = os.getenv("CHATBOT_BASE_URL", "http://localhost:8000")
-REDIS_URL  = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-USERS = {
-    "admin": "admin",
-    "foo"  : "foo",
-}
-TEST_PROMPTS = [
-    "Hello, I'm {name} – can you confirm?",
-    "What did I just tell you about my name?"
-]
-# ───────────────────────────────────────────────────────────────────────────────
+    if not admin_token or not foo_token:
+        print("\n❌ Test failed: Could not authenticate one or more users.")
+        print("👉 Please ensure you have created both users with the correct passwords.")
+        return
 
-rdb = redis.Redis.from_url(REDIS_URL, decode_responses=True)
+    admin_headers = {"Authorization": f"Bearer {admin_token}"}
+    foo_headers = {"Authorization": f"Bearer {foo_token}"}
+    print("✅ Users authenticated successfully.")
 
-def get_jwt(username: str, password: str) -> str:
-    resp = requests.post(
-        f"{BASE_URL}/api/token/",
-        json={"username": username, "password": password}
+    # 2. Admin creates a session and has a conversation
+    print("\nStep 2: Testing Admin's conversation...")
+    admin_session_id = create_chat_session(admin_headers)
+    ask_question(
+        headers=admin_headers,
+        session_id=admin_session_id,
+        question="My name is Admin, and my favorite color is blue.",
+        should_contain=None # This is the first message, no context to check yet
     )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Cannot log in {username}: {resp.text}")
-    return resp.json()["access"]
-
-def chat(jwt: str, message: str) -> str:
-    resp = requests.post(
-        f"{BASE_URL}/api/chat/",
-        headers={"Authorization": f"Bearer {jwt}"},
-        json={"message": message}
+    ask_question(
+        headers=admin_headers,
+        session_id=admin_session_id,
+        question="What is my name?",
+        should_contain="Admin"
     )
-    if resp.status_code != 200:
-        raise RuntimeError(f"Chat call failed: {resp.text}")
-    return resp.json()["answer"]
+    ask_question(
+        headers=admin_headers,
+        session_id=admin_session_id,
+        question="What is my favorite color?",
+        should_contain="blue"
+    )
+    print("✅ Admin's conversation test passed.")
 
-def redis_key(user_id: str) -> str:
-    """LangChain-Redis default key prefix is `message_store:{session_id}`."""
-    return f"message_store:{user_id}"
+    # 3. Foo checks for sessions (should have none) and starts their own
+    print("\nStep 3: Testing Foo's conversation and data isolation...")
+    sessions = list_chat_sessions(foo_headers)
+    if sessions:
+        print(f"❌ Test failed: User 'foo' should have 0 sessions but found {len(sessions)}.")
+        return
+    print("  - Verified 'foo' has no access to 'admin' sessions.")
 
-def fetch_history(user_id: str) -> List[str]:
-    key = redis_key(user_id)
-    raw_items = rdb.lrange(key, 0, -1)          # newest → oldest
-    # each item is JSON with shape {"type":"human"/"ai", "data":{"content":...}}
-    return [json.loads(item)["data"]["content"] for item in raw_items]
+    foo_session_id = create_chat_session(foo_headers)
+    ask_question(
+        headers=foo_headers,
+        session_id=foo_session_id,
+        question="My name is Foo, and I like the color green.",
+        should_contain=None
+    )
+    ask_question(
+        headers=foo_headers,
+        session_id=foo_session_id,
+        question="What is my favorite color?",
+        should_contain="green" # Should know 'green'
+    )
+    ask_question(
+        headers=foo_headers,
+        session_id=foo_session_id,
+        question="Do you know my name?",
+        should_contain="Foo" # Should know 'Foo'
+    )
+    print("✅ Foo's conversation test passed.")
 
-def main() -> None:
-    print("🔐  Obtaining JWTs…")
-    tokens = {u: get_jwt(u, pw) for u, pw in USERS.items()}
 
-    print("💬  Sending chat messages…")
-    for user, jwt in tokens.items():
-        for prompt in TEST_PROMPTS:
-            m = prompt.format(name=user.capitalize())
-            print(f"  → {user}: {m!r}")
-            answer = chat(jwt, m)
-            print(f"    ← {answer[:60]}…")
-            time.sleep(1)  # tiny delay so Redis order is predictable
+    # 4. Re-check Admin's session to ensure it wasn't affected by Foo's chat
+    print("\nStep 4: Re-testing Admin's session to ensure history is isolated...")
+    ask_question(
+        headers=admin_headers,
+        session_id=admin_session_id,
+        question="Just to be sure, what is my favorite color?",
+        should_contain="blue" # Must still be 'blue', not 'green'
+    )
+    print("✅ Admin's conversation history remains isolated and correct.")
+    
+    # 5. Admin deletes their session, and we verify it's gone
+    print("\nStep 5: Testing session deletion...")
+    delete_chat_session(admin_headers, admin_session_id)
+    sessions = list_chat_sessions(admin_headers)
+    if sessions:
+        print(f"❌ Test failed: 'admin' user should have 0 sessions after deletion but found {len(sessions)}.")
+        return
+    print("  - Verified 'admin' session was deleted.")
+    
+    # 6. Check that Foo's session still exists
+    sessions = list_chat_sessions(foo_headers)
+    if not sessions or sessions[0]['id'] != foo_session_id:
+        print(f"❌ Test failed: 'foo' user's session was deleted incorrectly.")
+        return
+    print("  - Verified 'foo' session was not affected by admin's deletion.")
+    
+    print("\n🎉 All tests passed successfully! 🎉")
+    print("\n👉 You can now check your Redis database. You should only see keys related to 'foo's session.")
+    print("   Example redis-cli command: SCAN 0 MATCH \"chat:*\"")
 
-    print("\n✅  All tests passed – histories are isolated per user.\n")
+
+# --- HELPER FUNCTIONS ---
+
+def get_jwt_token(user_credentials):
+    """Logs in a user and returns the access token."""
+    try:
+        response = requests.post(f"{BASE_URL}/api/token/", data=user_credentials)
+        response.raise_for_status() # Raises an exception for bad status codes (4xx or 5xx)
+        return response.json().get("access")
+    except requests.exceptions.RequestException as e:
+        print(f"  - Error getting token for {user_credentials['username']}: {e}")
+        return None
+
+def list_chat_sessions(headers):
+    """Fetches all chat sessions for the authenticated user."""
+    try:
+        response = requests.get(f"{BASE_URL}/api/chats/", headers=headers)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"  - Error listing chat sessions: {e}")
+        sys.exit(1) # Exit if we can't perform a basic operation
+
+def create_chat_session(headers):
+    """Creates a new chat session and returns its ID."""
+    try:
+        print("  - Creating a new chat session...")
+        response = requests.post(f"{BASE_URL}/api/chats/", headers=headers)
+        response.raise_for_status()
+        session_id = response.json().get("id")
+        print(f"  - Session created with ID: {session_id}")
+        return session_id
+    except requests.exceptions.RequestException as e:
+        print(f"  - Error creating chat session: {e}")
+        sys.exit(1)
+
+def ask_question(headers, session_id, question, should_contain):
+    """Sends a question to a session and validates the response."""
+    try:
+        print(f'  - Asking: "{question}"')
+        response = requests.post(f"{BASE_URL}/api/chats/{session_id}/", headers=headers, json={"message": question})
+        response.raise_for_status()
+        answer = response.json().get("answer", "")
+        print(f'  - Bot replied: "{answer}"')
+
+        if should_contain and should_contain.lower() not in answer.lower():
+            print(f"❌ Test failed: Bot's answer did not contain '{should_contain}'.")
+            sys.exit(1) # Stop the test script on failure
+        
+    except requests.exceptions.RequestException as e:
+        print(f"  - Error asking question: {e}")
+        sys.exit(1)
+
+def delete_chat_session(headers, session_id):
+    """Deletes a specific chat session."""
+    try:
+        print(f"  - Deleting session ID: {session_id}...")
+        response = requests.delete(f"{BASE_URL}/api/chats/{session_id}/", headers=headers)
+        response.raise_for_status()
+        print(f"  - Session {session_id} deleted.")
+    except requests.exceptions.RequestException as e:
+        print(f"  - Error deleting chat session: {e}")
+        sys.exit(1)
+
 
 if __name__ == "__main__":
-    try:
-        main()
-    except AssertionError as e:
-        print(f"❌  TEST FAILED: {e}")
-        sys.exit(1)
+    run_tests()

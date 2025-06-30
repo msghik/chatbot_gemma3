@@ -19,12 +19,19 @@ class ChatSessionListCreateAPIView(generics.ListCreateAPIView):
     serializer_class = ChatSessionSerializer
 
     def get_queryset(self):
-        # Only return sessions belonging to the currently authenticated user
+        """
+        THIS IS THE CRITICAL PART.
+        It filters the results to only include sessions owned by the
+        user making the request.
+        """
         return ChatSession.objects.filter(user=self.request.user).order_by('-created_at')
 
     def perform_create(self, serializer):
-        # Automatically assign the current user to the new chat session
+        """
+        This correctly assigns the user when a new session is created.
+        """
         serializer.save(user=self.request.user)
+
 
 
 # --- View for Handling a specific Chat Session (Send Message, Delete) ---
